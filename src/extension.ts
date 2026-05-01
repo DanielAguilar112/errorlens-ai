@@ -1,9 +1,4 @@
 import * as vscode from 'vscode';
-import Anthropic from '@anthropic-ai/sdk';
-
-const client = new Anthropic({
-  apiKey: vscode.workspace.getConfiguration('errorlensAi').get('apiKey') || ''
-});
 
 let outputChannel: vscode.OutputChannel;
 
@@ -11,54 +6,82 @@ export function activate(context: vscode.ExtensionContext) {
   outputChannel = vscode.window.createOutputChannel('ErrorLens AI');
   outputChannel.appendLine('ErrorLens AI activated');
 
-  // Watch terminal for errors
- const terminalDataListener = vscode.window.onDidChangeTerminalState(async (terminal) => {
-    // fallback: manual trigger only for now
+  // Auto-detect: watch for diagnostic changes (red squiggles)
+  const diagnosticListener = vscode.languages.onDidChangeDiagnostics(async (e) => {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) { return; }
+
+    // Only react if the active file has new errors
+    if (!e.uris.some(uri => uri.toString() === editor.document.uri.toString())) { return; }
+
+    const diagnostics = vscode.languages.getDiagnostics(editor.document.uri)
+      .filter(d => d.severity === vscode.DiagnosticSeverity.Error);
+
+    if (diagnostics.length === 0) { return; }
+
+    // Only auto-explain if setting is enabled
+    const autoExplain = vscode.workspace.getConfiguration('errorlensAi').get<boolean>('autoExplain');
+    if (!autoExplain) { return; }
+
+    const errorText = diagnostics
+      .slice(0, 3) // max 3 errors at once
+      .map(d => `Line ${d.range.start.line + 1}: ${d.message}`)
+      .join('\n');
+
+    await explainError(errorText, editor);
   });
 
   // Manual trigger command
   const explainCommand = vscode.commands.registerCommand('errorlens-ai.explain', async () => {
+    const editor = vscode.window.activeTextEditor;
+
+    // Try to use current file's errors first
+    if (editor) {
+      const diagnostics = vscode.languages.getDiagnostics(editor.document.uri)
+        .filter(d => d.severity === vscode.DiagnosticSeverity.Error);
+
+      if (diagnostics.length > 0) {
+        const errorText = diagnostics
+          .slice(0, 3)
+          .map(d => `Line ${d.range.start.line + 1}: ${d.message}`)
+          .join('\n');
+        await explainError(errorText, editor);
+        return;
+      }
+    }
+
+    // Fallback: manual paste
     const text = await vscode.window.showInputBox({
       prompt: 'Paste your error message',
       placeHolder: 'Error: cannot read properties of undefined...'
     });
-    if (text) { await explainError(text); }
+    if (text) { await explainError(text, editor); }
   });
 
-  context.subscriptions.push(terminalDataListener, explainCommand);
+  // Quick fix command from notification
+  const explainSelectionCommand = vscode.commands.registerCommand('errorlens-ai.explainSelection', async () => {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) { return; }
+    const selected = editor.document.getText(editor.selection);
+    if (selected) { await explainError(selected, editor); }
+  });
+
+  context.subscriptions.push(diagnosticListener, explainCommand, explainSelectionCommand);
 }
 
-function isError(text: string): boolean {
-  const errorPatterns = [
-    /error:/i,
-    /exception:/i,
-    /traceback/i,
-    /syntaxerror/i,
-    /typeerror/i,
-    /referenceerror/i,
-    /cannot read/i,
-    /is not defined/i,
-    /failed to/i,
-    /uncaught/i,
-  ];
-  return errorPatterns.some(p => p.test(text));
-}
-
-async function explainError(errorText: string) {
+async function explainError(errorText: string, editor?: vscode.TextEditor | null) {
   const apiKey = vscode.workspace.getConfiguration('errorlensAi').get<string>('apiKey');
   if (!apiKey) {
     vscode.window.showErrorMessage('ErrorLens AI: No API key set. Go to Settings → errorlensAi.apiKey');
     return;
   }
 
-  // Get open file context
-  const editor = vscode.window.activeTextEditor;
   const fileContext = editor
     ? `File: ${editor.document.fileName}\n\n${editor.document.getText().slice(0, 3000)}`
     : 'No file open';
 
   vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: 'ErrorLens AI: Analyzing error...' },
+    { location: vscode.ProgressLocation.Notification, title: 'ErrorLens AI: Analyzing...' },
     async () => {
       try {
         const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -83,7 +106,7 @@ ${fileContext}
 
 Respond in 3 sections:
 1. **What went wrong** (1-2 sentences)
-2. **Why it happened** (1-2 sentences)  
+2. **Why it happened** (1-2 sentences)
 3. **Fix** (specific code or steps)`
             }]
           })
